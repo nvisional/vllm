@@ -247,6 +247,7 @@ from vllm.model_executor.layers.quantization.utils.humming import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kMxfp4Static,
+    kMxfp8Static,
 )
 from vllm.platforms import PlatformEnum, current_platform
 
@@ -959,13 +960,18 @@ def choose_mp_linear_kernel(
 
 
 def init_mxfp8_linear_kernel(
-    *, weight_shape: tuple[int, int], bmm_batch_size: int | None = None
+    *,
+    weight_shape: tuple[int, int],
+    bmm_batch_size: int | None = None,
+    activation_quant_key: QuantKey | None = None,
 ) -> Mxfp8LinearKernel:
     """Select and instantiate the best MXFP8 linear kernel for the
     current platform and `(N, K)` weight shape."""
+    activation_quant_key = _resolve_linear_activation_key(activation_quant_key)
     config = Mxfp8LinearLayerConfig(
         weight_shape=weight_shape,
         bmm_batch_size=bmm_batch_size,
+        activation_quant_key=activation_quant_key,
     )
 
     platform = current_platform._enum
@@ -997,6 +1003,13 @@ def init_mxfp8_linear_kernel(
         is_supported, reason = kernel_cls.is_supported()
         if not is_supported:
             failure_reasons.append(f"{kernel_cls.__name__}: {reason}")
+            continue
+
+        if not kernel_cls._supports_quant_scheme(kMxfp8Static, activation_quant_key):
+            failure_reasons.append(
+                f"{kernel_cls.__name__}: quantization scheme "
+                f"{kMxfp8Static}x{activation_quant_key} not supported"
+            )
             continue
 
         can_implement, reason = kernel_cls.can_implement(config)

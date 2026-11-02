@@ -13,6 +13,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_SCALE_DTYPE,
     MXFP8_VALUE_DTYPE,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
@@ -76,7 +77,10 @@ class CompressedTensorsW8A8Mxfp8(CompressedTensorsScheme):
         )
         layer.register_parameter("weight_scale", weight_scale)
 
-        self.kernel = init_mxfp8_linear_kernel(weight_shape=layer.weight.shape)
+        self.kernel = init_mxfp8_linear_kernel(
+            weight_shape=layer.weight.shape,
+            activation_quant_key=kMxfp8Dynamic,
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer)

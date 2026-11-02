@@ -15,6 +15,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kMxfp8Dynamic,
+    kMxfp8Static,
 )
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
@@ -42,6 +43,15 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
     """MXFP8 W8A8 GEMM via FlashInfer CUTLASS (SM100+)."""
 
     supports_pre_processed_weights = True
+
+    @classmethod
+    def _supports_quant_scheme(
+        cls,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        # W8A8: activations are MXFP8-dynamic (self-quantized if needed).
+        return weight_key == kMxfp8Static and activation_key == kMxfp8Dynamic
 
     @classmethod
     def is_supported(
@@ -129,6 +139,15 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
     supports_pre_processed_weights = True
 
     @classmethod
+    def _supports_quant_scheme(
+        cls,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        # W8A8: activations are MXFP8-dynamic (self-quantized if needed).
+        return weight_key == kMxfp8Static and activation_key == kMxfp8Dynamic
+
+    @classmethod
     def is_supported(
         cls, compute_capability: int | None = None
     ) -> tuple[bool, str | None]:
@@ -200,6 +219,15 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
 
 class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
     """MXFP8 W8A8 GEMM via FlashInfer's TensorRT-LLM wrapper."""
+
+    @classmethod
+    def _supports_quant_scheme(
+        cls,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        # W8A8: activations are MXFP8-dynamic (self-quantized if needed).
+        return weight_key == kMxfp8Static and activation_key == kMxfp8Dynamic
 
     @classmethod
     def is_supported(

@@ -6,7 +6,11 @@ from dataclasses import dataclass
 
 import torch
 
-from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    QuantKey,
+    kMxfp8Dynamic,
+    kMxfp8Static,
+)
 
 
 @dataclass
@@ -18,11 +22,14 @@ class Mxfp8LinearLayerConfig:
 
     Attributes:
         weight_shape: The layer's `(out_features, in_features)`, i.e. `(N, K)`.
+        activation_quant_key: Identifies the activation quantization format,
+            or `None` when activations must not be quantized.
 
     """
 
     weight_shape: tuple[int, int]
     bmm_batch_size: int | None = None
+    activation_quant_key: QuantKey | None = None
 
 
 class Mxfp8LinearKernel(ABC):
@@ -30,6 +37,9 @@ class Mxfp8LinearKernel(ABC):
 
     Each subclass implements a specific GEMM backend (FlashInfer CUTLASS,
     Marlin, emulation).
+    The kernel selection mechanism iterates over registered subclasses in
+    priority order, calling ``is_supported``, ``_supports_quant_scheme`` and
+    ``can_implement`` to find the best match for the current hardware.
     """
 
     supports_pre_processed_weights: bool = False
@@ -53,6 +63,21 @@ class Mxfp8LinearKernel(ABC):
         cls, compute_capability: int | None = None
     ) -> tuple[bool, str | None]:
         raise NotImplementedError
+
+    @classmethod
+    def _supports_quant_scheme(
+        cls,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        """Return whether this kernel implements *weight_key* x *activation_key*.
+
+        Selection uses this to dispatch on the requested activation format
+        (from the checkpoint or ``--quantization-config.linear.activation``).
+        The default covers MXFP8 weights with MXFP8 or unquantized activations;
+        kernels for other activation formats override it.
+        """
+        return weight_key == kMxfp8Static and activation_key in (None, kMxfp8Dynamic)
 
     @classmethod
     @abstractmethod
