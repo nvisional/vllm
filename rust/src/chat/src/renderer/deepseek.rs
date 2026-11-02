@@ -77,12 +77,15 @@ impl DsDialect {
     }
 }
 
-#[serde_with::skip_serializing_none]
+/// Match native Python FunctionDefinition serialization: always emit
+/// `description` (null when absent) so vllm-rs and native prompts share a
+/// prefix; still omit `strict` when unset.
 #[derive(Debug, Serialize)]
 struct RenderedToolSchema<'a> {
     name: &'a str,
     description: Option<&'a str>,
     parameters: &'a Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
     strict: Option<bool>,
 }
 

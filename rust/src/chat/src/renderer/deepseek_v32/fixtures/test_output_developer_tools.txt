@@ -30,7 +30,7 @@ If the thinking_mode is enabled, then after function results you should strongly
 
 Here are the functions available in JSONSchema format:
 <functions>
-{"name": "lookup", "parameters": {"type": "object"}}
+{"name": "lookup", "description": null, "parameters": {"type": "object"}}
 </functions>
 
 

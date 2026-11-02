@@ -13,7 +13,7 @@ use crate::EffortValue;
 use crate::event::{AssistantContentBlock, AssistantToolCall};
 use crate::renderer::deepseek_v41::DeepSeekV41ChatRenderer;
 use crate::renderer::test_utils::{FixtureRequestOptions, fixture_chat_request};
-use crate::request::{ChatContentPart, ChatMessage, ChatRequest, ChatTool, GenerationPromptMode};
+use crate::request::{ChatContentPart, ChatMessage, ChatRequest, ChatTool, ChatToolChoice, GenerationPromptMode, ResolvedToolContext};
 
 fn render_request(request: &ChatRequest) -> String {
     DeepSeekV4ChatRenderer::default()
@@ -194,6 +194,46 @@ fn tools_keep_historical_developer() {
     let rendered = render_request(&request);
 
     assert!(rendered.contains("<｜User｜>old instruction"));
+}
+
+#[test]
+fn tool_schema_emits_null_description_when_absent() {
+    // Native Python FunctionDefinition always serializes missing description as
+    // null; vllm-rs must match so prefix-cache keys stay aligned (#65116).
+    let tools = vec![ChatTool {
+        name: "get_weather".to_string(),
+        description: None,
+        parameters: Value::Object(Default::default()),
+        strict: None,
+        defer_loading: None,
+    }];
+    let messages = vec![ChatMessage::user("weather?")];
+    let mut request = ChatRequest {
+        messages: messages.clone(),
+        tool_context: ResolvedToolContext::new(
+            &messages,
+            tools,
+            Some(ChatToolChoice::Auto),
+            true,
+        )
+        .unwrap(),
+        ..ChatRequest::for_test()
+    };
+    request
+        .chat_options
+        .template_kwargs
+        .insert("thinking".to_string(), Value::Bool(true));
+
+    let rendered = render_request(&request);
+
+    assert!(
+        rendered.contains(r#""name": "get_weather", "description": null"#),
+        "expected null description in tool schema JSON, got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains(r#""name": "get_weather", "parameters""#),
+        "description key must not be omitted entirely"
+    );
 }
 
 #[test]
