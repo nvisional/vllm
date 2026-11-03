@@ -238,7 +238,12 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
 
     def get_kv_connector_kv_cache_events(self) -> LMCacheKVEvents | None:
         """Get the KV connector kv cache events collected during the last interval."""
-        events = self._lmcache_engine.get_kv_events()  # type: ignore [attr-defined]
+        # Native LMCache adapter (use_native) has no get_kv_events; guard like
+        # get_block_ids_with_load_errors (#62216).
+        method = getattr(self._lmcache_engine, "get_kv_events", None)
+        if not callable(method):
+            return None
+        events = method()
         if not events:
             return None
 
