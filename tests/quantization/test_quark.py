@@ -938,6 +938,44 @@ def test_quant_method_dispatch_ignored(default_vllm_config):
     )
 
 
+def test_quant_method_dispatch_ignored_weight_name_exclude(default_vllm_config):
+    """Quark exclude entries may be weight names ending in .weight (#65034)."""
+    config = _make_qtensor_config(
+        None,
+        None,
+        exclude=[
+            "mtp.fc.weight",
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "lm_head",
+        ],
+    )
+
+    class TestLinear(LinearBase):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+
+    assert config.get_quant_method_target("mtp.fc", LinearBase) == (
+        None,
+        None,
+        UnquantizedLinearMethod,
+    )
+    assert isinstance(
+        config.get_quant_method(TestLinear(), "mtp.fc"), UnquantizedLinearMethod
+    )
+    assert config.get_quant_method_target(
+        "mtp.layers.0.self_attn.q_proj", LinearBase
+    ) == (
+        None,
+        None,
+        UnquantizedLinearMethod,
+    )
+    assert config.get_quant_method_target("lm_head", LinearBase) == (
+        None,
+        None,
+        UnquantizedLinearMethod,
+    )
+
+
 @pytest.mark.parametrize("case", QTENSOR_CONFIGS, ids=lambda case: case.name)
 def test_quant_method_dispatch_target(case):
     config = _make_qtensor_config(case.weight, case.input_tensors)

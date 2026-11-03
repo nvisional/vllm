@@ -238,9 +238,18 @@ class QuarkConfig(QuantizationConfig):
         ``None`` denotes an unquantized/BF16 activation.
         """
         is_routed_experts = issubclass(layer_type, RoutedExperts)
+        # Quark exports some exclude entries by checkpoint weight name
+        # (e.g. "mtp.fc.weight") and others by module name (e.g. "lm_head").
+        # should_ignore_layer() matches module prefixes exactly, so strip a
+        # trailing ".weight" so BF16 layers declared via weight names are not
+        # silently quantized (#65034).
+        exclude_layers = [
+            name[: -len(".weight")] if name.endswith(".weight") else name
+            for name in cast(list[str], self.quant_config.get("exclude")) or []
+        ]
         if should_ignore_layer(
             prefix,
-            ignore=cast(list[str], self.quant_config.get("exclude")),
+            ignore=exclude_layers,
             fused_mapping=self.packed_modules_mapping,
             check_children=is_routed_experts,
         ):
