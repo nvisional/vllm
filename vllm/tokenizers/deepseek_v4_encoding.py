@@ -297,7 +297,10 @@ def render_message(
 
     elif role == "developer":
         if not content:
-            raise ValueError(f"Invalid message for role `{role}`: {msg}")
+            raise ValueError(
+                f"Invalid message for role `{role}`: content must be a "
+                "non-empty string"
+            )
 
         content_developer = USER_SP_TOKEN
         content_developer += content

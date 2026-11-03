@@ -1091,6 +1091,41 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def check_developer_message_content(cls, data):
+        """Reject empty/missing developer message content with HTTP 400.
+
+        ``content: null`` is already rejected by the OpenAI TypedDict/pydantic
+        string schema. Empty string and omitted ``content`` previously passed
+        request validation and later failed inside DeepSeek chat-template
+        encoding with ``AssertionError`` (HTTP 500), leaking internal
+        ``_image_indices`` renderer state in the error body (#65357).
+        """
+        if not isinstance(data, dict):
+            return data
+        messages = data.get("messages", [])
+        if not isinstance(messages, list):
+            return data
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "developer":
+                continue
+            if "content" not in msg:
+                raise VLLMValidationError(
+                    "Developer message must include a non-empty `content` "
+                    "field.",
+                    parameter="messages",
+                )
+            content = msg.get("content")
+            if content is None or content == "" or content == []:
+                raise VLLMValidationError(
+                    "Developer message `content` must be a non-empty string "
+                    "(or a non-empty list of content parts).",
+                    parameter="messages",
+                    value=content,
+                )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def check_system_message_content_type(cls, data):
         """Warn if system messages contain non-text content.
 

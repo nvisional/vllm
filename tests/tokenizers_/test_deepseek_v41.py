@@ -375,3 +375,41 @@ def test_dropped_developer_only_image_leaves_text_prompt(render_with_media):
     assert "<｜deepseek_image｜>" not in prompt["prompt"]
     assert "multi_modal_data" not in prompt
     assert "multi_modal_uuids" not in prompt
+
+
+@pytest.mark.parametrize(
+    "messages,kwargs",
+    [
+        (
+            [{"role": "developer", "content": "", "_image_indices": []}],
+            {"thinking_mode": "chat"},
+        ),
+        (
+            [{"role": "developer", "_image_indices": []}, {"role": "user", "content": "hi"}],
+            {"thinking_mode": "chat"},
+        ),
+        (
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "developer", "content": "", "_image_indices": []},
+            ],
+            {"thinking_mode": "thinking", "drop_thinking": False},
+        ),
+    ],
+)
+def test_empty_developer_content_is_a_request_error(messages, kwargs):
+    """Empty developer content must raise ValueError (HTTP 400), not assert.
+
+    Regression for #65357: the encoder used ``assert content``, which became
+    HTTP 500 and dumped ``_image_indices`` into the client error body.
+    """
+    from vllm.entrypoints.serve.exception_handling.error_response import (
+        create_error_response,
+    )
+
+    with pytest.raises(ValueError, match="non-empty string") as exc_info:
+        encode_messages(messages, **kwargs)
+
+    err = create_error_response(exc_info.value)
+    assert err.error.code == 400
+    assert "_image_indices" not in err.error.message
