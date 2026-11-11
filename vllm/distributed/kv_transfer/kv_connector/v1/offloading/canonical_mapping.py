@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
+    group_kernel_blocks,
 )
 from vllm.v1.kv_offload.base import CanonicalPageMapping, CopyRun
 
@@ -71,12 +72,19 @@ class _RankContext:
 
 @dataclass(frozen=True)
 class ByteRegion:
-    """A byte region within a page that repeats once per token."""
+    """A byte region within a page that repeats once per token.
+
+    `token_start` / `token_count` select a sub-range of the manager
+    block (kernel-split pages). `canonical_offset` is still the byte
+    position of local token 0 for this region, matching unsplit pages.
+    """
 
     local_offset: int
     canonical_offset: int
     bytes_per_token: int
     canonical_token_stride: int
+    token_start: int = 0
+    token_count: int | None = None
 
 
 def _coalesce_runs(runs: list[CopyRun]) -> tuple[CopyRun, ...]:
@@ -120,27 +128,32 @@ def _interleave_cp_tokens(
     num_tokens: int,
     ctx: _RankContext,
 ) -> tuple[CopyRun, ...]:
-    """Place each region's num_tokens rows at their canonical token positions,
+    """Place each region's token rows at their canonical token positions,
     one run per chunk of interleaved tokens."""
     runs: list[CopyRun] = []
     for region in regions:
+        start = region.token_start
+        count = (
+            region.token_count if region.token_count is not None else num_tokens - start
+        )
         if ctx.cp_size == 1:
             runs.append(
                 CopyRun(
                     region.local_offset,
-                    region.canonical_offset,
+                    region.canonical_offset + start * region.canonical_token_stride,
                     region.bytes_per_token,
-                    num_tokens,
+                    count,
                     region.bytes_per_token,
                     region.canonical_token_stride,
                 )
             )
             continue
-        for chunk_start in range(0, num_tokens, ctx.interleave):
+        for chunk_start in range(start, start + count, ctx.interleave):
             canonical_token = _local_to_canonical_token(chunk_start, ctx)
             runs.append(
                 CopyRun(
-                    region.local_offset + chunk_start * region.bytes_per_token,
+                    region.local_offset
+                    + (chunk_start - start) * region.bytes_per_token,
                     region.canonical_offset
                     + canonical_token * region.canonical_token_stride,
                     region.bytes_per_token,
@@ -247,6 +260,137 @@ def _split_kv_regions(
     return None
 
 
+def _kernel_split_attention_byte_regions(
+    kv_cache: torch.Tensor,
+    spec: AttentionSpec,
+    num_blocks: int,
+    head_shard: int,
+    num_head_shards: int,
+    cp_size: int,
+) -> list[ByteRegion] | None:
+    """Byte regions for a manager page split into uniformly strided kernel blocks.
+
+    Accepts the raw kernel-block view `(ratio * num_blocks, ...)` and the
+    grouped view `(num_blocks, ratio, ...)`. Canonical offsets use the
+    manager block size so heads stay spaced across the full offloaded page.
+    """
+    if num_blocks <= 0 or kv_cache.shape[0] % num_blocks:
+        return None
+    if kv_cache.shape[0] == num_blocks:
+        if kv_cache.ndim not in (5, 6) or kv_cache.shape[1] <= 1:
+            return None
+        grouped = kv_cache
+    else:
+        grouped = group_kernel_blocks(kv_cache, num_blocks)
+    ratio = grouped.shape[1]
+    if ratio <= 1 or spec.block_size % ratio:
+        return None
+    kernel_bs = spec.block_size // ratio
+
+    bs, heads, head_size = spec.block_size, spec.num_kv_heads, spec.head_size
+    elem = grouped.element_size()
+    kernel = grouped[:, 0]
+
+    if grouped.ndim == 5 and tuple(kernel.shape[1:]) == (
+        heads,
+        kernel_bs,
+        2 * head_size,
+    ):
+        if heads * bs * 2 * head_size * elem != spec.real_page_size_bytes:
+            return None
+        _, head_stride, token_stride, inner_stride = kernel.stride()
+        if inner_stride != 1:
+            return None
+        head_bytes = 2 * head_size * elem
+        token_row_bytes = heads * head_bytes
+        kernel_page_bytes = kernel_bs * token_row_bytes
+        if head_stride == 2 * head_size and token_stride == heads * 2 * head_size:
+            return [
+                ByteRegion(
+                    local_offset=k * kernel_page_bytes,
+                    canonical_offset=head_shard * token_row_bytes,
+                    bytes_per_token=token_row_bytes,
+                    canonical_token_stride=num_head_shards * token_row_bytes,
+                    token_start=k * kernel_bs,
+                    token_count=kernel_bs,
+                )
+                for k in range(ratio)
+            ]
+        if head_stride == kernel_bs * 2 * head_size and token_stride == 2 * head_size:
+            canonical_span = bs * cp_size
+            return [
+                ByteRegion(
+                    local_offset=k * kernel_page_bytes + head * kernel_bs * head_bytes,
+                    canonical_offset=(head_shard * heads + head)
+                    * canonical_span
+                    * head_bytes,
+                    bytes_per_token=head_bytes,
+                    canonical_token_stride=head_bytes,
+                    token_start=k * kernel_bs,
+                    token_count=kernel_bs,
+                )
+                for k in range(ratio)
+                for head in range(heads)
+            ]
+        return None
+
+    if grouped.ndim == 6 and tuple(kernel.shape[1:]) == (
+        2,
+        kernel_bs,
+        heads,
+        head_size,
+    ):
+        if 2 * bs * heads * head_size * elem != spec.real_page_size_bytes:
+            return None
+        _, half_stride, token_stride, head_stride, inner_stride = kernel.stride()
+        if inner_stride != 1 or half_stride != kernel_bs * heads * head_size:
+            return None
+        head_bytes = head_size * elem
+        token_row_bytes = heads * head_bytes
+        kernel_page_bytes = 2 * kernel_bs * token_row_bytes
+        canonical_span = bs * cp_size
+        if token_stride == heads * head_size and head_stride == head_size:
+            canonical_half_bytes = canonical_span * num_head_shards * token_row_bytes
+            return [
+                ByteRegion(
+                    local_offset=k * kernel_page_bytes
+                    + half * kernel_bs * token_row_bytes,
+                    canonical_offset=half * canonical_half_bytes
+                    + head_shard * token_row_bytes,
+                    bytes_per_token=token_row_bytes,
+                    canonical_token_stride=num_head_shards * token_row_bytes,
+                    token_start=k * kernel_bs,
+                    token_count=kernel_bs,
+                )
+                for k in range(ratio)
+                for half in range(2)
+            ]
+        if head_stride == kernel_bs * head_size and token_stride == head_size:
+            total_heads = num_head_shards * heads
+            return [
+                ByteRegion(
+                    local_offset=(
+                        k * kernel_page_bytes
+                        + half * heads * kernel_bs * head_bytes
+                        + head * kernel_bs * head_bytes
+                    ),
+                    canonical_offset=(half * total_heads + head_shard * heads + head)
+                    * canonical_span
+                    * head_bytes,
+                    bytes_per_token=head_bytes,
+                    canonical_token_stride=head_bytes,
+                    token_start=k * kernel_bs,
+                    token_count=kernel_bs,
+                )
+                for k in range(ratio)
+                for half in range(2)
+                for head in range(heads)
+            ]
+        return None
+
+    return None
+
+
 def _attention_byte_regions(
     kv_cache: torch.Tensor,
     spec: AttentionSpec,
@@ -262,7 +406,9 @@ def _attention_byte_regions(
         return _packed_kv_regions(kv_cache, spec, head_shard, num_head_shards, cp_size)
     if tuple(kv_cache.shape) == (num_blocks, 2, bs, heads, head_size):
         return _split_kv_regions(kv_cache, spec, head_shard, num_head_shards, cp_size)
-    return None
+    return _kernel_split_attention_byte_regions(
+        kv_cache, spec, num_blocks, head_shard, num_head_shards, cp_size
+    )
 
 
 def _layer_mapping(

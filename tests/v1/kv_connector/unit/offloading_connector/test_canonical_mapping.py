@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVQuantMode,
     MLAAttentionSpec,
+    group_kernel_blocks,
 )
 from vllm.v1.kv_offload.base import CanonicalPageMapping, CopyRun
 
@@ -36,11 +37,13 @@ def _ctx(rank, tp=1, dcp=1, pcp=1, interleave=1, total=None, heads=2):
     )
 
 
-def _full_spec(num_kv_heads: int = 2, **kwargs) -> FullAttentionSpec:
-    # block_size=4, head_dim=64, int8
+def _full_spec(
+    num_kv_heads: int = 2, block_size: int = 4, **kwargs
+) -> FullAttentionSpec:
+    # default block_size=4, head_dim=64, int8
     return TritonAttentionBackend.customize_spec(
         FullAttentionSpec(
-            block_size=4,
+            block_size=block_size,
             num_kv_heads=num_kv_heads,
             head_size=64,
             dtype=torch.int8,
@@ -534,3 +537,192 @@ def test_derive_refuses_foreign_worker_groups():
         )
         == {}
     )
+
+
+# ---------------------------------------------------------------------------
+# Kernel-split manager blocks (FlashInfer on pre-Blackwell, block_size > 64)
+# ---------------------------------------------------------------------------
+
+
+def _packed_nhd_kernel_split(spec, kernel_block_size: int) -> torch.Tensor:
+    """Logical (ratio * num_blocks, heads, kernel_bs, 2 * head_size) over NHD
+    physical pages — the FlashInfer view of a split manager block."""
+    ratio = spec.block_size // kernel_block_size
+    return torch.zeros(
+        NUM_BLOCKS * ratio,
+        kernel_block_size,
+        spec.num_kv_heads,
+        2 * spec.head_size,
+        dtype=torch.int8,
+    ).permute(0, 2, 1, 3)
+
+
+def _packed_hnd_kernel_split(spec, kernel_block_size: int) -> torch.Tensor:
+    ratio = spec.block_size // kernel_block_size
+    return torch.zeros(
+        NUM_BLOCKS * ratio,
+        spec.num_kv_heads,
+        kernel_block_size,
+        2 * spec.head_size,
+        dtype=torch.int8,
+    )
+
+
+def _split_nhd_kernel_split(spec, kernel_block_size: int) -> torch.Tensor:
+    ratio = spec.block_size // kernel_block_size
+    return torch.zeros(
+        NUM_BLOCKS * ratio,
+        2,
+        kernel_block_size,
+        spec.num_kv_heads,
+        spec.head_size,
+        dtype=torch.int8,
+    )
+
+
+def _split_hnd_kernel_split(spec, kernel_block_size: int) -> torch.Tensor:
+    ratio = spec.block_size // kernel_block_size
+    return torch.zeros(
+        NUM_BLOCKS * ratio,
+        2,
+        spec.num_kv_heads,
+        kernel_block_size,
+        spec.head_size,
+        dtype=torch.int8,
+    ).permute(0, 1, 3, 2, 4)
+
+
+KERNEL_SPLIT_BUILDERS = {
+    "split_nhd": _split_nhd_kernel_split,
+    "split_hnd": _split_hnd_kernel_split,
+    "packed_nhd": _packed_nhd_kernel_split,
+    "packed_hnd": _packed_hnd_kernel_split,
+}
+
+
+def _kernel_split_local_page(form, kernel_bs, manager_bs, heads, head_size) -> bytes:
+    """Local page bytes: kernel_bs-token pages laid out back to back."""
+    return b"".join(
+        _reference_page(form, range(start, start + kernel_bs), heads, head_size)
+        for start in range(0, manager_bs, kernel_bs)
+    )
+
+
+@pytest.mark.parametrize("form", sorted(KERNEL_SPLIT_BUILDERS))
+@pytest.mark.parametrize("kernel_block_size", [32, 64])
+def test_kernel_split_view_is_certified(form, kernel_block_size):
+    """A 128-token manager block viewed as kernel blocks is still certified."""
+    spec = _full_spec(block_size=128)
+    cache = KERNEL_SPLIT_BUILDERS[form](spec, kernel_block_size)
+    mapping = _try_mapping(spec, cache, _ctx(0, tp=1, total=2))
+    assert mapping is not None
+    assert mapping.parallelism_agnostic
+    assert mapping.local_page_size_bytes == spec.real_page_size_bytes
+    _verify_tiling(
+        form,
+        [_mapping(spec, cache, _ctx(rank, tp=4, total=8)) for rank in range(4)],
+    )
+
+
+def test_kernel_split_grouped_view_is_certified():
+    """group_kernel_blocks output (N, ratio, ...) must be recognized too."""
+    spec = _full_spec(block_size=128)
+    cache = _packed_nhd_kernel_split(spec, 64)
+    grouped = group_kernel_blocks(cache, NUM_BLOCKS)
+    assert grouped.shape[0] == NUM_BLOCKS
+    assert grouped.shape[1] == 2
+    mapping = _try_mapping(spec, grouped, _ctx(0, tp=1, total=2))
+    assert mapping is not None
+    assert mapping.parallelism_agnostic
+
+
+@pytest.mark.parametrize("form", sorted(KERNEL_SPLIT_BUILDERS))
+def test_kernel_split_cross_tp_store_load(form):
+    """Kernel-split local pages store and load a shared canonical page across TP."""
+    kernel_bs, manager_bs, total_heads = 64, 128, 8
+    spec_full = _full_spec(num_kv_heads=total_heads, block_size=manager_bs)
+    canonical_size = spec_full.real_page_size_bytes
+    reference = _reference_page(form, range(manager_bs), range(total_heads), 64)
+
+    def mappings_at(tp: int):
+        spec = _full_spec(num_kv_heads=total_heads // tp, block_size=manager_bs)
+        cache = KERNEL_SPLIT_BUILDERS[form](spec, kernel_bs)
+        return [
+            _mapping(spec, cache, _ctx(rank, tp=tp, total=total_heads))
+            for rank in range(tp)
+        ]
+
+    for tp in (4, 2, 1):
+        mappings = mappings_at(tp)
+        heads_per_rank = total_heads // tp
+        pages = [
+            _kernel_split_local_page(
+                form,
+                kernel_bs,
+                manager_bs,
+                range(rank * heads_per_rank, (rank + 1) * heads_per_rank),
+                64,
+            )
+            for rank in range(tp)
+        ]
+        assert all(
+            len(page) == m.local_page_size_bytes for page, m in zip(pages, mappings)
+        )
+        assert _store_all(mappings, pages, canonical_size) == reference
+        for mapping, page in zip(mappings, pages):
+            assert mapping.parallelism_agnostic
+            assert _load_one(mapping, reference) == page
+
+
+def test_kernel_split_tp2_pcp2_store_load():
+    """Kernel-split pages still tile a TP x PCP canonical page (interleave=1)."""
+    form, kernel_bs, manager_bs = "packed_nhd", 64, 128
+    spec = _full_spec(block_size=manager_bs)
+    cache = _packed_nhd_kernel_split(spec, kernel_bs)
+    mappings = [
+        _mapping(
+            spec,
+            cache,
+            _ctx(rank, tp=2, dcp=1, pcp=2, interleave=1, total=4),
+        )
+        for rank in range(4)
+    ]
+    pcp_tokens = (tuple(range(0, 256, 2)), tuple(range(1, 256, 2)))
+    rank_coordinates = (
+        (pcp_tokens[0], (0, 1)),
+        (pcp_tokens[0], (2, 3)),
+        (pcp_tokens[1], (0, 1)),
+        (pcp_tokens[1], (2, 3)),
+    )
+    pages = []
+    for tokens, heads in rank_coordinates:
+        page = b"".join(
+            _reference_page(
+                form, tokens[start : start + kernel_bs], heads, spec.head_size
+            )
+            for start in range(0, manager_bs, kernel_bs)
+        )
+        pages.append(page)
+    reference = _reference_page(form, range(256), range(4), spec.head_size)
+    _verify_tiling("kernel-split-tp2-pcp2", mappings)
+    assert _store_all(mappings, pages, len(reference)) == reference
+    for rank, (mapping, page) in enumerate(zip(mappings, pages)):
+        assert mapping.canonical_page_size_bytes == len(reference)
+        assert mapping.local_page_size_bytes == len(page)
+        assert not mapping.parallelism_agnostic
+        assert _load_one(mapping, reference) == page, f"rank {rank}"
+
+
+def test_derive_kernel_split_stays_parallelism_agnostic():
+    """FlashInfer's (2N, H, 64, C) view must not fall through to the opaque fallback."""
+    spec = _full_spec(block_size=128)
+    kv_cache_config = _kv_cache_config(
+        [KVCacheGroupSpec(layer_names=["attn"], kv_cache_spec=spec)]
+    )
+    kv_caches = {"attn": _packed_nhd_kernel_split(spec, 64)}
+    mappings = derive_canonical_mappings(
+        _vllm_config(tp=2, total_kv_heads=4), kv_cache_config, kv_caches
+    )
+    assert set(mappings) == {"attn"}
+    assert mappings["attn"].parallelism_agnostic
+    assert mappings["attn"].canonical_page_size_bytes == 2 * spec.real_page_size_bytes
